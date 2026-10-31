@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: swift build -c release
+      - name: Unit tests
+        run: swift test
+      - name: Keychain integration tests
+        run: SSK_KEYCHAIN_TESTS=1 swift test --filter SystemKeychainTests
+
+  ios:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests on iOS Simulator
+        run: |
+          xcodebuild test \
+            -scheme SecureStorageKit-Package \
+            -destination 'platform=iOS Simulator,name=iPhone 16'
+      - name: Build example app
+        run: |
+          xcodebuild build \
+            -project Examples/SecureStorageDemo/SecureStorageDemo.xcodeproj \
+            -scheme SecureStorageDemo \
+            -destination 'generic/platform=iOS Simulator'

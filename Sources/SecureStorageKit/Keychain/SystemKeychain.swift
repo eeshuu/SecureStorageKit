@@ -73,6 +73,14 @@ public struct SystemKeychain: KeychainBackend {
         return items.compactMap { $0[kSecAttrAccount] as? String }
     }
 
+    public func updateData(_ key: KeychainItemKey, data: Data, prompt: AuthenticationPrompt?) throws -> Bool {
+        // SecItemUpdate keeps the item's access control and accessibility.
+        var query = baseQuery(key)
+        if let prompt { query[kSecUseAuthenticationContext] = Self.context(for: prompt) }
+        try check(SecItemUpdate(query as CFDictionary, [kSecValueData: data] as CFDictionary))
+        return true
+    }
+
     // MARK: - Queries
 
     private func baseQuery(_ key: KeychainItemKey, synchronizable: CFTypeRef = kSecAttrSynchronizableAny) -> [CFString: Any] {

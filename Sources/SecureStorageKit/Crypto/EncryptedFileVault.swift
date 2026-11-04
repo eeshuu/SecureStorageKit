@@ -42,8 +42,7 @@ public struct EncryptedFileVault: Sendable {
             let input = try FileHandle(forReadingFrom: source)
             defer { try? input.close() }
             try Self.writeAtomically(to: destination) { output in
-                var prefix = Data(count: Self.prefixSize)
-                prefix.withUnsafeMutableBytes { _ = SecRandomCopyBytes(kSecRandomDefault, Self.prefixSize, $0.baseAddress!) }
+                let prefix = try Self.randomPrefix()
                 let header = Self.header(chunkSize: chunkSize, keyID: keyID, prefix: prefix)
                 try output.write(contentsOf: header)
 
@@ -82,8 +81,7 @@ public struct EncryptedFileVault: Sendable {
     /// Encrypts data into the vault file format, without touching the disk.
     public func encrypt(_ data: Data) async throws -> Data {
         let (keyID, key) = try await keyManager.currentKey(named: keyName)
-        var prefix = Data(count: Self.prefixSize)
-        prefix.withUnsafeMutableBytes { _ = SecRandomCopyBytes(kSecRandomDefault, Self.prefixSize, $0.baseAddress!) }
+        let prefix = try Self.randomPrefix()
         let header = Self.header(chunkSize: chunkSize, keyID: keyID, prefix: prefix)
         var output = header
         var offset = data.startIndex
@@ -149,6 +147,15 @@ public struct EncryptedFileVault: Sendable {
             throw StorageError.unsupportedFormat
         }
         return (fixed + rest, chunkSize, keyID, Data(rest.suffix(prefixSize)))
+    }
+
+    /// The random per-file nonce prefix. Fails instead of continuing with predictable bytes,
+    /// which would repeat nonces across files encrypted with the same key.
+    static func randomPrefix() throws -> Data {
+        var prefix = Data(count: prefixSize)
+        let status = prefix.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, prefixSize, $0.baseAddress!) }
+        guard status == errSecSuccess else { throw StorageError.cryptoFailure }
+        return prefix
     }
 
     static func nonce(_ prefix: Data, _ index: UInt32, _ isFinal: Bool) throws -> AES.GCM.Nonce {

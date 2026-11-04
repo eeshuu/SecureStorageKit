@@ -44,6 +44,10 @@ public actor KeyManager {
     private let encryption = EncryptionManager()
     private var rings: [String: KeyRing] = [:]
     private var loading: [String: Task<KeyRing, Error>] = [:]
+    /// The version being created for each key name. Creation runs one at a time per name:
+    /// the actor is re-entrant across `await`, so without this two callers could both create
+    /// "version 1" with different key material.
+    private var creating: [String: Task<KeyRing, Error>] = [:]
 
     /// - Parameters:
     ///   - storage: Where key material is kept. Use a dedicated namespace.
@@ -59,9 +63,9 @@ public actor KeyManager {
     public func currentKey(named name: String = defaultKeyName) async throws -> (id: String, key: SymmetricKey) {
         var ring = try await loadRing(name)
         if ring.current == nil {
-            ring = try await addVersion(to: ring)
+            ring = try await createVersion(name, onlyIfMissing: true)
         }
-        let version = ring.current!.version
+        guard let version = ring.current?.version else { throw StorageError.keyNotFound(id: Self.keyID(name, 0)) }
         return (Self.keyID(name, version), try await material(name, version))
     }
 
@@ -77,9 +81,10 @@ public actor KeyManager {
     /// Creates a new active version; the previous one becomes decrypt-only.
     @discardableResult
     public func rotate(named name: String = defaultKeyName) async throws -> KeyVersion {
-        let ring = try await addVersion(to: try await loadRing(name))
+        let ring = try await createVersion(name, onlyIfMissing: false)
         emit(.keyRotate, name)
-        return ring.current!
+        guard let current = ring.current else { throw StorageError.keyNotFound(id: Self.keyID(name, 0)) }
+        return current
     }
 
     /// Destroys a decrypt-only version's key material. Call it once no data
@@ -179,12 +184,42 @@ public actor KeyManager {
         rings[ring.name] = ring
     }
 
+    /// Adds a version, waiting for any creation already running for `name`. With
+    /// `onlyIfMissing`, returns the existing ring if it already has an active version.
+    private func createVersion(_ name: String, onlyIfMissing: Bool) async throws -> KeyRing {
+        while true {
+            if let running = creating[name] {
+                _ = try? await running.value
+                // Whoever sees the finished task first clears it; otherwise this loop could spin
+                // before the creator gets to run its own cleanup.
+                if creating[name] == running { creating[name] = nil }
+                continue
+            }
+            let ring = try await loadRing(name)
+            if creating[name] != nil { continue }   // another caller started while we were loading
+            if onlyIfMissing, ring.current != nil { return ring }
+            let task = Task { try await self.addVersion(to: ring) }
+            creating[name] = task
+            defer { if creating[name] == task { creating[name] = nil } }
+            return try await task.value
+        }
+    }
+
     private func addVersion(to ring: KeyRing) async throws -> KeyRing {
         var ring = ring
         let version = (ring.versions.map(\.version).max() ?? 0) + 1
         let key = EncryptionManager.generateKey()
         let bytes = key.withUnsafeBytes { Data($0) }
-        try await storage.saveData(bytes, forKey: Self.materialKey(ring.name, version), protection: protection)
+        do {
+            // Insert only: key material is never overwritten, even if another KeyManager on the
+            // same storage created this version first.
+            try await storage.saveData(bytes, forKey: Self.materialKey(ring.name, version), protection: protection, mode: .insertOnly)
+        } catch StorageError.duplicateItem {
+            rings[ring.name] = nil
+            let stored = try await loadRing(ring.name)
+            guard stored.versions.contains(where: { $0.version == version }) else { throw StorageError.duplicateItem }
+            return stored
+        }
         for index in ring.versions.indices where ring.versions[index].state == .active {
             ring.versions[index].state = .decryptOnly
         }

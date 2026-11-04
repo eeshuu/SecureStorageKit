@@ -19,7 +19,7 @@ Free and open: one library, every feature included.
 In Xcode, choose **File ▸ Add Package Dependencies…** and add the repository URL. Alternatively, add it to `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/eeshuu/SecureStorageKit.git", from: "1.0.0"),
+.package(url: "https://github.com/eeshuu/SecureStorageKit.git", from: "1.0.1"),
 // …
 .target(name: "App", dependencies: [
     .product(name: "SecureStorageKit", package: "SecureStorageKit"),

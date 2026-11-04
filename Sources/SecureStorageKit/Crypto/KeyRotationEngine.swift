@@ -45,6 +45,11 @@ public struct KeyRotationEngine: Sendable {
     }
 
     /// Re-encrypts every record not on the active version. Safe to run repeatedly.
+    ///
+    /// With `retireWhenComplete`, old versions are destroyed once every record in `store` is
+    /// migrated. Only do that when `store` holds **all** data encrypted with `keyName`; if the
+    /// same key also protects other data (files, another table), migrate those first or pass
+    /// `false` and call `KeyManager.retire` yourself.
     public func migrate(_ store: some EncryptedRecordStore, retireWhenComplete: Bool = true) async throws -> RotationReport {
         let active = try await keyManager.currentKey(named: keyName).id
         var report = RotationReport(activeKeyID: active)

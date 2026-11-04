@@ -68,6 +68,9 @@ public struct StorageConfiguration: Sendable {
     /// `clearAll()` leave other code's Keychain items alone.
     var accountPrefix: String { "ssk/\(namespace)/" }
 
+    /// Accounts of values staged by an in-progress replace (see `SecureStorage.replace`).
+    var stagingPrefix: String { "ssk-staging/\(namespace)/" }
+
     func validate() throws {
         if service.isEmpty { throw StorageError.invalidConfiguration("service must not be empty") }
         if namespace.isEmpty || namespace.contains("/") {
@@ -91,6 +94,13 @@ enum NamespaceEncoding {
     static func encode(_ id: String) -> String {
         var allowed = CharacterSet.alphanumerics
         allowed.insert(charactersIn: "-_.")
+        return id.addingPercentEncoding(withAllowedCharacters: allowed) ?? id
+    }
+
+    /// Like `encode`, but also escapes `.`, so encoded ids can't be mistaken for namespace separators.
+    static func encodeStrict(_ id: String) -> String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-_")
         return id.addingPercentEncoding(withAllowedCharacters: allowed) ?? id
     }
 

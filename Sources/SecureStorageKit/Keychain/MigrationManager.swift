@@ -53,7 +53,7 @@ public struct MigrationManager: Sendable {
 
         for account in accounts.sorted() {
             // Never re-import our own items if the services coincide.
-            if account.hasPrefix("ssk/") { continue }
+            if account.hasPrefix("ssk/") || account.hasPrefix("ssk-staging/") { continue }
             guard let key = source.keyMapping(account) else {
                 report.skippedByMapping.append(account)
                 continue

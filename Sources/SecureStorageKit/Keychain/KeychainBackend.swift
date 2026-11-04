@@ -76,4 +76,13 @@ public protocol KeychainBackend: Sendable {
     func delete(_ key: KeychainItemKey) throws -> Bool
     /// All account names stored under a service and access group. Never shows authentication UI.
     func accounts(service: String, accessGroup: String?) throws -> [String]
+    /// Replaces only the data of an existing item, keeping its accessibility and protection.
+    /// May show authentication UI for protected items. Returns `false` if the backend can't
+    /// update in place; callers then leave the item unchanged.
+    func updateData(_ key: KeychainItemKey, data: Data, prompt: AuthenticationPrompt?) throws -> Bool
+}
+
+extension KeychainBackend {
+    /// Backends written before 1.0.1 don't update in place.
+    public func updateData(_ key: KeychainItemKey, data: Data, prompt: AuthenticationPrompt?) throws -> Bool { false }
 }

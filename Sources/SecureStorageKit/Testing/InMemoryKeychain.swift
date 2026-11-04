@@ -89,6 +89,29 @@ public final class InMemoryKeychain: KeychainBackend, @unchecked Sendable {
         lock.sync { items.removeValue(forKey: key) != nil }
     }
 
+    public func updateData(_ key: KeychainItemKey, data: Data, prompt: AuthenticationPrompt?) throws -> Bool {
+        try lock.sync {
+            guard var item = items[key] else { throw StorageError.itemNotFound }
+            if _isLocked, item.accessibility == .whenUnlocked || item.accessibility == .whenUnlockedThisDeviceOnly
+                || item.accessibility == .whenPasscodeSetThisDeviceOnly {
+                throw StorageError.interactionNotAllowed
+            }
+            if item.protection.requiresAuthentication {
+                if prompt?.allowsInteraction == false { throw StorageError.interactionNotAllowed }
+                _promptCount += 1
+                try _authenticationResult.get()
+            }
+            item.data = data
+            items[key] = item
+            return true
+        }
+    }
+
+    /// The protection an item was saved with, for tests.
+    public func protection(of key: KeychainItemKey) -> ItemProtection? {
+        lock.sync { items[key]?.protection }
+    }
+
     public func accounts(service: String, accessGroup: String?) throws -> [String] {
         lock.sync {
             items.keys.filter { $0.service == service && $0.accessGroup == accessGroup }.map(\.account).sorted()

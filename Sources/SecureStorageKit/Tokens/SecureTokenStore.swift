@@ -58,6 +58,9 @@ public actor SecureTokenStore {
     private let base: SecureStorage
     private let refresher: (any TokenRefresher)?
     private var refreshes: [String: Task<TokenSet, Error>] = [:]
+    /// Bumped by `logout`, so a refresh that was already running can't save tokens afterwards.
+    private var generations: [String: Int] = [:]
+    private var loggingOut: Set<String> = []
 
     private static let tokensKey = "tokens"
     private static let indexKey = "accounts"
@@ -82,12 +85,14 @@ public actor SecureTokenStore {
 
     public func save(_ tokens: TokenSet, for account: String = "default") async throws {
         try await storage(account).save(tokens, forKey: Self.tokensKey)
+        try await deleteLegacyTokens(account)
         try await addToIndex(account)
     }
 
     /// The stored tokens, possibly expired.
     public func tokens(for account: String = "default") async throws -> TokenSet? {
-        try await storage(account).retrieve(Self.tokensKey, as: TokenSet.self)
+        if let tokens = try await storage(account).retrieve(Self.tokensKey, as: TokenSet.self) { return tokens }
+        return try await migrateLegacyTokens(account)
     }
 
     /// A non-expired access token, refreshing first if needed.
@@ -97,18 +102,19 @@ public actor SecureTokenStore {
     public func validAccessToken(for account: String = "default", leeway: TimeInterval = 30) async throws -> String {
         guard let tokens = try await tokens(for: account) else { throw StorageError.itemNotFound }
         guard tokens.isExpired(leeway: leeway) else { return tokens.accessToken }
-        return try await refresh(account: account, current: tokens).accessToken
+        return try await refresh(account: account, current: tokens, leeway: leeway).accessToken
     }
 
     /// Forces a refresh now, sharing any refresh already in progress.
     @discardableResult
     public func refresh(account: String = "default") async throws -> TokenSet {
         guard let tokens = try await tokens(for: account) else { throw StorageError.itemNotFound }
-        return try await refresh(account: account, current: tokens)
+        return try await refresh(account: account, current: tokens, leeway: nil)
     }
 
     public func deleteTokens(for account: String = "default") async throws {
         try await storage(account).delete(Self.tokensKey)
+        try await deleteLegacyTokens(account)
     }
 
     // MARK: Sessions
@@ -119,10 +125,17 @@ public actor SecureTokenStore {
     }
 
     /// Removes the account's tokens and every session-owned secret.
+    ///
+    /// A refresh that is still running when you log out is discarded: it can't
+    /// write tokens back afterwards.
     public func logout(account: String = "default") async throws {
+        generations[account, default: 0] += 1
+        loggingOut.insert(account)
+        defer { loggingOut.remove(account) }
         refreshes[account]?.cancel()
         refreshes[account] = nil
         try await storage(account).clearAll()
+        try await legacyStorage(account)?.clearAll()
         try await sessionStorage(for: account).clearAll()
         var accounts = try await self.accounts()
         accounts.removeAll { $0 == account }
@@ -143,9 +156,33 @@ public actor SecureTokenStore {
 
     // MARK: Internals
 
+    /// Token namespace: `<ns>.tok.<account>`, with `.` escaped in the account, so it can never
+    /// equal a session namespace (`<ns>.session.<account>`) or another account's tokens.
     private func storage(_ account: String) throws -> SecureStorage {
         guard !account.isEmpty else { throw StorageError.invalidConfiguration("account must not be empty") }
-        return base.namespaced("\(base.configuration.namespace).\(NamespaceEncoding.encode(account))")
+        return base.namespaced("\(base.configuration.namespace).tok.\(NamespaceEncoding.encodeStrict(account))")
+    }
+
+    /// 1.0.0 kept tokens in `<ns>.<account>`, which could equal another account's session
+    /// namespace. Accounts whose old namespace looks like a session namespace are ambiguous
+    /// and never read from there.
+    private func legacyStorage(_ account: String) throws -> SecureStorage? {
+        guard !account.isEmpty else { throw StorageError.invalidConfiguration("account must not be empty") }
+        let encoded = NamespaceEncoding.encode(account)
+        guard !encoded.hasPrefix("session."), !encoded.hasPrefix("tok.") else { return nil }
+        return base.namespaced("\(base.configuration.namespace).\(encoded)")
+    }
+
+    private func migrateLegacyTokens(_ account: String) async throws -> TokenSet? {
+        guard let legacy = try legacyStorage(account),
+              let tokens = try await legacy.retrieve(Self.tokensKey, as: TokenSet.self) else { return nil }
+        try await storage(account).save(tokens, forKey: Self.tokensKey)
+        try await legacy.delete(Self.tokensKey)
+        return tokens
+    }
+
+    private func deleteLegacyTokens(_ account: String) async throws {
+        try await legacyStorage(account)?.delete(Self.tokensKey)
     }
 
     private func addToIndex(_ account: String) async throws {
@@ -155,16 +192,29 @@ public actor SecureTokenStore {
         try await base.save(accounts, forKey: Self.indexKey)
     }
 
-    private func refresh(account: String, current: TokenSet) async throws -> TokenSet {
+    /// `leeway` nil forces a refresh; otherwise tokens another caller already refreshed are returned as is.
+    private func refresh(account: String, current: TokenSet, leeway: TimeInterval?) async throws -> TokenSet {
         if let running = refreshes[account] { return try await running.value }
+        guard !loggingOut.contains(account) else { throw StorageError.itemNotFound }
         guard let refresher else { throw StorageError.tokenExpired }
-        guard let refreshToken = current.refreshToken else { throw StorageError.noRefreshToken }
+        let generation = generations[account, default: 0]
+
+        // Another call may have refreshed (and rotated the refresh token) while this one was
+        // waiting. Re-read so a spent refresh token is never sent again.
+        guard let latest = try await tokens(for: account) else { throw StorageError.itemNotFound }
+        if let running = refreshes[account] { return try await running.value }
+        if latest != current, let leeway, !latest.isExpired(leeway: leeway) { return latest }
+        guard let refreshToken = latest.refreshToken else { throw StorageError.noRefreshToken }
 
         let task = Task { try await refresher.refreshTokens(using: refreshToken, account: account) }
         refreshes[account] = task
-        defer { refreshes[account] = nil }
+        defer { if refreshes[account] == task { refreshes[account] = nil } }
         do {
             var fresh = try await task.value
+            // Logged out while the request was running: don't bring the tokens back.
+            guard generations[account, default: 0] == generation, !loggingOut.contains(account) else {
+                throw StorageError.itemNotFound
+            }
             // Servers that don't rotate refresh tokens omit them; keep the old one.
             if fresh.refreshToken == nil { fresh.refreshToken = refreshToken }
             try await storage(account).save(fresh, forKey: Self.tokensKey)

@@ -84,26 +84,43 @@ public final class SecureStorage: SecureStoring {
             protection: protection ?? configuration.protection,
             synchronizable: configuration.synchronizable,
             label: configuration.service)
+        let staging = try stagingKey(key)
         let backend = self.backend
         try await run(.save, key: key) {
             switch mode {
             case .insertOnly:
+                // A staged copy left by an interrupted replace counts as an existing item.
+                if try backend.exists(staging) { throw StorageError.duplicateItem }
                 try backend.add(request)
             case .updateOnly:
-                guard try backend.exists(request.key) else { throw StorageError.itemNotFound }
-                try backend.delete(request.key)
-                try backend.add(request)
+                guard try backend.exists(request.key) || backend.exists(staging) else { throw StorageError.itemNotFound }
+                try Self.replace(request, staging: staging, backend: backend)
             case .upsert:
                 do {
                     try backend.add(request)
+                    _ = try? backend.delete(staging)
                 } catch StorageError.duplicateItem {
-                    // Delete + add (not SecItemUpdate) so the new protection and
-                    // accessibility apply and replacing a protected item never prompts.
-                    try backend.delete(request.key)
-                    try backend.add(request)
+                    try Self.replace(request, staging: staging, backend: backend)
                 }
             }
         }
+    }
+
+    /// Replaces an item without ever losing the old value to a failed write.
+    ///
+    /// Delete + add (not SecItemUpdate) so new protection and accessibility apply and
+    /// replacing a protected item never prompts. The new value is first written to a
+    /// staging slot: that proves the write can succeed (device locked, access control,
+    /// entitlements) before the old item is deleted. If the final add still fails, the
+    /// staged copy remains and reads fall back to it.
+    static func replace(_ request: KeychainWriteRequest, staging: KeychainItemKey, backend: any KeychainBackend) throws {
+        var staged = request
+        staged.key = staging
+        _ = try? backend.delete(staging)
+        try backend.add(staged)
+        if try backend.exists(request.key) { try backend.delete(request.key) }
+        try backend.add(request)
+        _ = try? backend.delete(staging)
     }
 
     /// Replaces an existing value. Throws `.itemNotFound` if the key doesn't exist.
@@ -130,12 +147,14 @@ public final class SecureStorage: SecureStoring {
     /// Reads raw bytes, or nil if the key doesn't exist.
     public func retrieveData(_ key: String, prompt: AuthenticationPrompt? = nil) async throws -> Data? {
         let itemKey = try itemKey(key)
+        let staging = try stagingKey(key)
         let backend = self.backend
         return try await run(.read, key: key, outcome: { $0 == nil ? .notFound : .success }) { () -> Data? in
             do {
                 return try backend.read(itemKey, prompt: prompt)
             } catch StorageError.itemNotFound {
-                return nil
+                // The value of an interrupted replace lives in the staging slot.
+                do { return try backend.read(staging, prompt: prompt) } catch StorageError.itemNotFound { return nil }
             }
         }
     }
@@ -166,12 +185,27 @@ public final class SecureStorage: SecureStoring {
                 throw StorageError.obsoleteRecord(foundVersion: envelope.schema, minimumSupported: T.minimumSupportedVersion)
             }
             let migrated = try T.migrate(from: envelope.schema, data: envelope.payload, serializer: configuration.serializer)
-            try await saveVersioned(migrated, forKey: key)
+            try? await rewriteInPlace(key, data: try encode(RecordEnvelope(schema: T.schemaVersion, payload: try encode(migrated))),
+                                      prompt: prompt)
             return migrated
         } catch StorageError.obsoleteRecord(let found, let minimum) {
             guard policy == .delete else { throw StorageError.obsoleteRecord(foundVersion: found, minimumSupported: minimum) }
             try await delete(key)
             return nil
+        }
+    }
+
+    /// Stores the migrated record in the same item, keeping its protection and accessibility
+    /// (saving it again would apply the configuration's defaults, which may be weaker).
+    /// Best effort: if the backend can't update in place or the update fails, the old record
+    /// stays and is migrated again on the next read.
+    private func rewriteInPlace(_ key: String, data: Data, prompt: AuthenticationPrompt?) async throws {
+        let itemKey = try itemKey(key)
+        let staging = try stagingKey(key)
+        let backend = self.backend
+        try await run(.migrate, key: key) {
+            let target = try backend.exists(itemKey) ? itemKey : staging
+            _ = try backend.updateData(target, data: data, prompt: prompt)
         }
     }
 
@@ -181,26 +215,33 @@ public final class SecureStorage: SecureStoring {
     @discardableResult
     public func delete(_ key: String) async throws -> Bool {
         let itemKey = try itemKey(key)
+        let staging = try stagingKey(key)
         let backend = self.backend
-        return try await run(.delete, key: key, outcome: { $0 ? .success : .notFound }) { try backend.delete(itemKey) }
+        return try await run(.delete, key: key, outcome: { $0 ? .success : .notFound }) {
+            let deleted = try backend.delete(itemKey)
+            return try backend.delete(staging) || deleted
+        }
     }
 
     /// True if the key exists. Never prompts for authentication.
     public func contains(_ key: String) async throws -> Bool {
         let itemKey = try itemKey(key)
+        let staging = try stagingKey(key)
         let backend = self.backend
-        return try await perform { try backend.exists(itemKey) }
+        return try await perform { try backend.exists(itemKey) || backend.exists(staging) }
     }
 
     /// The keys stored in this namespace, sorted.
     public func allKeys() async throws -> [String] {
         try configuration.validate()
-        let (backend, service, group, prefix) = (backend, configuration.resolvedService, configuration.accessGroup, configuration.accountPrefix)
+        let (backend, service, group) = (backend, configuration.resolvedService, configuration.accessGroup)
+        let prefixes = [configuration.accountPrefix, configuration.stagingPrefix]
         return try await run(.list, key: nil) {
-            try backend.accounts(service: service, accessGroup: group)
-                .filter { $0.hasPrefix(prefix) }
-                .map { String($0.dropFirst(prefix.count)) }
-                .sorted()
+            var keys = Set<String>()
+            for account in try backend.accounts(service: service, accessGroup: group) {
+                if let prefix = prefixes.first(where: account.hasPrefix) { keys.insert(String(account.dropFirst(prefix.count))) }
+            }
+            return keys.sorted()
         }
     }
 
@@ -208,9 +249,10 @@ public final class SecureStorage: SecureStoring {
     /// environments and Keychain items written by other code are untouched.
     public func clearAll() async throws {
         try configuration.validate()
-        let (backend, service, group, prefix) = (backend, configuration.resolvedService, configuration.accessGroup, configuration.accountPrefix)
+        let (backend, service, group) = (backend, configuration.resolvedService, configuration.accessGroup)
+        let prefixes = [configuration.accountPrefix, configuration.stagingPrefix]
         try await run(.clear, key: nil) {
-            for account in try backend.accounts(service: service, accessGroup: group) where account.hasPrefix(prefix) {
+            for account in try backend.accounts(service: service, accessGroup: group) where prefixes.contains(where: account.hasPrefix) {
                 try backend.delete(KeychainItemKey(service: service, account: account, accessGroup: group))
             }
         }
@@ -224,6 +266,13 @@ public final class SecureStorage: SecureStoring {
         return KeychainItemKey(service: configuration.resolvedService,
                                account: configuration.accountPrefix + key,
                                accessGroup: configuration.accessGroup)
+    }
+
+    /// Where a replace stages the new value before deleting the old one.
+    func stagingKey(_ key: String) throws -> KeychainItemKey {
+        var k = try itemKey(key)
+        k.account = configuration.stagingPrefix + key
+        return k
     }
 
     func encode<T: Encodable>(_ value: T) throws -> Data {

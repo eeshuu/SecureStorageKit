@@ -24,7 +24,7 @@ jobs:
       - name: Unit tests on iOS Simulator
         run: |
           xcodebuild test \
-            -scheme SecureStorageKit-Package \
+            -scheme SecureStorageKit \
             -destination 'platform=iOS Simulator,name=iPhone 16'
       - name: Build example app
         run: |
